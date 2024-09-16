@@ -1,47 +1,45 @@
-#include "CreateCaloCells.h"
+#include "CreatePositionedCaloCells.h"
 
 // k4geo
 #include "detectorCommon/DetUtils_k4geo.h"
 
-// k4FWCore
-#include "k4Interface/IGeoSvc.h"
-
-// DD4hep
-#include "DD4hep/Detector.h"
-#include "DD4hep/Volumes.h"
-#include "TGeoManager.h"
-
 // edm4hep
 #include "edm4hep/CalorimeterHit.h"
 
-DECLARE_COMPONENT(CreateCaloCells)
+DECLARE_COMPONENT(CreatePositionedCaloCells)
 
-CreateCaloCells::CreateCaloCells(const std::string& name, ISvcLocator* svcLoc) :
-Gaudi::Algorithm(name, svcLoc), m_geoSvc("GeoSvc", name) {
+CreatePositionedCaloCells::CreatePositionedCaloCells(const std::string& name, ISvcLocator* svcLoc) :
+Gaudi::Algorithm(name, svcLoc) {
   declareProperty("hits", m_hits, "Hits from which to create cells (input)");
   declareProperty("cells", m_cells, "The created calorimeter cells (output)");
 
-  declareProperty("crosstalksTool", m_crosstalksTool, "Handle for the cell crosstalk tool");
+  declareProperty("positionsTool", m_cellPositionsTool, "Handle for cell positions tool");
+  declareProperty("crosstalkTool", m_crosstalkTool, "Handle for the cell crosstalk tool");
   declareProperty("calibTool", m_calibTool, "Handle for tool to calibrate Geant4 energy to EM scale tool");
   declareProperty("noiseTool", m_noiseTool, "Handle for the calorimeter cells noise tool");
   declareProperty("geometryTool", m_geoTool, "Handle for the geometry tool");
 }
 
-StatusCode CreateCaloCells::initialize() {
+StatusCode CreatePositionedCaloCells::initialize() {
   StatusCode sc = Gaudi::Algorithm::initialize();
   if (sc.isFailure()) return sc;
 
-  info() << "CreateCaloCells initialized" << endmsg;
+  info() << "CreatePositionedCaloCells initialized" << endmsg;
   info() << "do calibration : " << m_doCellCalibration << endmsg;
-  info() << "add cell noise      : " << m_addCellNoise << endmsg;
+  info() << "add cell noise : " << m_addCellNoise << endmsg;
   info() << "remove cells below threshold : " << m_filterCellNoise << endmsg;
-  info() << "add position information to the cell : " << m_addPosition << endmsg;
   info() << "emulate crosstalk : " << m_addCrosstalk << endmsg;
 
   // Initialization of tools
+
+  // Cell position tool
+  if (!m_cellPositionsTool.retrieve()) {
+    error() << "Unable to retrieve the cell positions tool!!!" << endmsg;
+    return StatusCode::FAILURE;
+  }
   // Cell crosstalk tool
   if (m_addCrosstalk) {
-    if (!m_crosstalksTool.retrieve()) {
+    if (!m_crosstalkTool.retrieve()) {
       error() << "Unable to retrieve the cell crosstalk tool!!!" << endmsg;
       return StatusCode::FAILURE;
     }
@@ -77,9 +75,6 @@ StatusCode CreateCaloCells::initialize() {
       m_emptyCellsMap = m_cellsMap;
     }
   }
-  if (m_addPosition){
-    m_volman = m_geoSvc->getDetector()->volumeManager();
-  }
 
   // Copy over the CellIDEncoding string from the input collection to the output collection
   auto hitsEncoding = m_hitsCellIDEncoding.get_optional();
@@ -92,7 +87,7 @@ StatusCode CreateCaloCells::initialize() {
   return StatusCode::SUCCESS;
 }
 
-StatusCode CreateCaloCells::execute(const EventContext&) const {
+StatusCode CreatePositionedCaloCells::execute(const EventContext&) const {
   // Get the input collection with Geant4 hits
   const edm4hep::SimCalorimeterHitCollection* hits = m_hits.get();
   debug() << "Input Hit collection size: " << hits->size() << endmsg;
@@ -113,8 +108,8 @@ StatusCode CreateCaloCells::execute(const EventContext&) const {
 
 
   // 1. Merge energy deposits into cells
-  // If running with noise map already was prepared. Otherwise it is being
-  // created below
+  // If running with noise, map was already prepared in initialize().
+  // Otherwise it is being created below
   for (const auto& hit : *hits) {
     verbose() << "CellID : " << hit.getCellID() << endmsg;
     m_cellsMap[hit.getCellID()] += hit.getEnergy();
@@ -122,28 +117,28 @@ StatusCode CreateCaloCells::execute(const EventContext&) const {
   debug() << "Number of calorimeter cells after merging of hits: " << m_cellsMap.size() << endmsg;
 
   // 2. Emulate cross-talk (if asked)
-  if(m_addCrosstalk) {
+  if (m_addCrosstalk) {
     // Derive the cross-talk contributions without affecting yet the nominal energy
     // (one has to emulate crosstalk based on cells free from any cross-talk contributions)
-    m_CrosstalkCellsMap.clear(); // this is a temporary map to hold energy exchange due to cross-talk, without affecting yet the nominal energy
+    m_crosstalkCellsMap.clear(); // this is a temporary map to hold energy exchange due to cross-talk, without affecting yet the nominal energy
     // loop over cells with nominal energies
     for (const auto& this_cell : m_cellsMap) {
       uint64_t this_cellId = this_cell.first;
-      auto vec_neighbours = m_crosstalksTool->getNeighbours(this_cellId); // a vector of neighbour IDs
-      auto vec_crosstalks = m_crosstalksTool->getCrosstalks(this_cellId); // a vector of crosstalk coefficients
+      auto vec_neighbours = m_crosstalkTool->getNeighbours(this_cellId); // a vector of neighbour IDs
+      auto vec_crosstalks = m_crosstalkTool->getCrosstalks(this_cellId); // a vector of crosstalk coefficients
       // loop over crosstalk neighbours of the cell under study
       for (unsigned int i_cell=0; i_cell<vec_neighbours.size(); i_cell++) {
         // signal transfer = energy deposit brought by EM shower hits * crosstalk coefficient
         double signal_transfer = this_cell.second * vec_crosstalks[i_cell];
         // for the cell under study, record the signal transfer that will be subtracted from its final cell energy
-        m_CrosstalkCellsMap[this_cellId] -= signal_transfer;
+        m_crosstalkCellsMap[this_cellId] -= signal_transfer;
         // for the crosstalk neighbour, record the signal transfer that will be added to its final cell energy
-        m_CrosstalkCellsMap[vec_neighbours[i_cell]] += signal_transfer;
+        m_crosstalkCellsMap[vec_neighbours[i_cell]] += signal_transfer;
       }
     }
 
     // apply the cross-talk contributions on the nominal cell-energy map
-    for (const auto& this_cell : m_CrosstalkCellsMap) {
+    for (const auto& this_cell : m_crosstalkCellsMap) {
       m_cellsMap[this_cell.first] += this_cell.second;
     }
     
@@ -172,15 +167,27 @@ StatusCode CreateCaloCells::execute(const EventContext&) const {
       newCell.setEnergy(cell.second);
       uint64_t cellid = cell.first;
       newCell.setCellID(cellid);
-      if (m_addPosition){
-        auto detelement = m_volman.lookupDetElement(cellid);
-        const auto& transformMatrix = detelement.nominal().worldTransformation();
-        double outGlobal[3];
-        double inLocal[] = {0, 0, 0};
-        transformMatrix.LocalToMaster(inLocal, outGlobal);
-        edm4hep::Vector3f position = edm4hep::Vector3f(outGlobal[0] / dd4hep::mm, outGlobal[1] / dd4hep::mm, outGlobal[2] / dd4hep::mm);
-        newCell.setPosition(position);
+
+      // add cell position
+      auto cached_pos = m_positions_cache.find(cellid);
+      if(cached_pos == m_positions_cache.end()) {
+        // retrieve position from tool
+        dd4hep::Position posCell = m_cellPositionsTool->xyzPosition(cellid);
+        edm4hep::Vector3f edmPos;
+        edmPos.x = posCell.x() / dd4hep::mm;
+        edmPos.y = posCell.y() / dd4hep::mm;
+        edmPos.z = posCell.z() / dd4hep::mm;
+        m_positions_cache[cellid] = edmPos;
+        newCell.setPosition(edmPos);
       }
+      else {
+        newCell.setPosition(cached_pos->second);
+      }
+
+      debug() << "Cell energy (GeV) : " << newCell.getEnergy() << "\tcellID " << newCell.getCellID() << endmsg;
+      debug() << "Position of cell (mm) : \t" << newCell.getPosition().x/dd4hep::mm
+                                      << "\t" << newCell.getPosition().y/dd4hep::mm
+                                      << "\t" << newCell.getPosition().z/dd4hep::mm << endmsg;
     }
   }
 
@@ -192,4 +199,4 @@ StatusCode CreateCaloCells::execute(const EventContext&) const {
   return StatusCode::SUCCESS;
 }
 
-StatusCode CreateCaloCells::finalize() { return Gaudi::Algorithm::finalize(); }
+StatusCode CreatePositionedCaloCells::finalize() { return Gaudi::Algorithm::finalize(); }
